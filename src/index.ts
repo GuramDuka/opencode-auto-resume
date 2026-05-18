@@ -34,6 +34,7 @@ interface SessionWatch {
     continuing: boolean
     todos: Todo[]
     todoCheckAttempts: number
+    toolTextTimer: ReturnType<typeof setTimeout> | null
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +237,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 continuing: false,
                 todos: [],
                 todoCheckAttempts: 0,
+                toolTextTimer: null,
             }
             sessions.set(sid, w)
         }
@@ -429,6 +431,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
         } finally {
             w.continuing = false
+        w.todoCheckAttempts = 0
+        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         }
     }
 
@@ -522,6 +526,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.continueTimestamps = []
         w.idleSince = null
         w.continuing = false
+        w.todoCheckAttempts = 0
+        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
     }
 
     function resetIdleFlags(w: SessionWatch) {
@@ -539,6 +545,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         async function checkForToolCallAsText(sid: string, w: SessionWatch) {
         if (typeof sid !== "string" || !sid) return
         if (w.userCancelled || w.toolTextRecovered) return
+        if (w.status !== "idle") return
 
         // v8.0: Backoff for tool-text recovery
         if (w.toolTextAttempts > 0) {
@@ -650,6 +657,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 `${bestCandidate.source} detected on ${short(sid)}! ` +
                 `Attempt ${w.toolTextAttempts}/${maxRetries}. Sending recovery prompt...`,
             )
+
+            // Guard: don't send if another plugin or user recently sent a prompt
+            const timeSinceActivity = Date.now() - w.lastActivityAt
+            if (timeSinceActivity < TOOL_TEXT_CHECK_DELAY_MS) {
+                await log("info", `${short(sid)} - skipping ${bestCandidate.source}, session was active ${Math.round(timeSinceActivity / 1000)}s ago`)
+                return
+            }
 
             if (isHallucinationLoop(sid)) {
                 await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
@@ -907,7 +921,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     // v8.0: TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
-                        setTimeout(() => {
+                        w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
                     }
@@ -939,7 +953,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     // v8.0: Also check for tool-call-as-text on legacy idle event
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
-                        setTimeout(() => {
+                        w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
                     }
