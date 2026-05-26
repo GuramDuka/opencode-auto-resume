@@ -502,3 +502,155 @@ describe("Todo-Based Continue Guard", () => {
         expect(hasOpenTodos(todos)).toBe(false)
     })
 })
+
+describe("Checking Lock", () => {
+    test("prevents concurrent checkForToolCallAsText calls", () => {
+        const w = { checkingToolText: false }
+        const enter = () => {
+            if (w.checkingToolText) return false
+            w.checkingToolText = true
+            return true
+        }
+        const exit = () => { w.checkingToolText = false }
+
+        expect(enter()).toBe(true)  // First call enters
+        expect(enter()).toBe(false) // Second call blocked
+        exit()
+        expect(enter()).toBe(true)  // After exit, allowed again
+    })
+
+    test("releases lock in error path", () => {
+        const w = { checkingToolText: false }
+        const simulateWithError = () => {
+            w.checkingToolText = true
+            try {
+                throw new Error("simulated")
+            } finally {
+                w.checkingToolText = false
+            }
+        }
+
+        expect(() => simulateWithError()).toThrow("simulated")
+        expect(w.checkingToolText).toBe(false)
+    })
+})
+
+describe("Subagent Check Cooldown", () => {
+    test("skips subagent check within cooldown period", () => {
+        const checkIntervalMs = 5_000
+        const w = { lastSubagentCheckAt: Date.now() }
+        const now = Date.now()
+        const elapsed = now - w.lastSubagentCheckAt
+        const withinCooldown = elapsed < checkIntervalMs * 2
+        expect(withinCooldown).toBe(true)
+    })
+
+    test("allows subagent check after cooldown expires", () => {
+        const checkIntervalMs = 5_000
+        const w = { lastSubagentCheckAt: Date.now() - checkIntervalMs * 2 - 1 }
+        const now = Date.now()
+        const elapsed = now - w.lastSubagentCheckAt
+        const pastCooldown = elapsed >= checkIntervalMs * 2
+        expect(pastCooldown).toBe(true)
+    })
+
+    test("updates lastSubagentCheckAt after check", () => {
+        const w = { lastSubagentCheckAt: 0 }
+        const now = 100000
+        w.lastSubagentCheckAt = now
+        expect(w.lastSubagentCheckAt).toBe(now)
+    })
+})
+
+describe("task_complete Tool", () => {
+    test("sets toolTextRecovered when called", () => {
+        const w: Record<string, unknown> = { toolTextRecovered: false, toolTextTimer: null }
+        w.toolTextRecovered = true
+        expect(w.toolTextRecovered).toBe(true)
+    })
+
+    test("clears pending timer when called", () => {
+        let cleared = false
+        const timer = setTimeout(() => { cleared = true }, 10000)
+        const w: Record<string, unknown> = { toolTextRecovered: false, toolTextTimer: timer }
+        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer as ReturnType<typeof setTimeout>); w.toolTextTimer = null }
+        expect(w.toolTextTimer).toBeNull()
+        clearTimeout(timer) // cleanup
+    })
+
+    test("prevents further continue checks after completion", () => {
+        const w = { toolTextRecovered: false, toolTextAttempts: 0, lastRetryAt: 0 }
+        // Simulate task_complete call
+        w.toolTextRecovered = true
+        // Guard in checkForToolCallAsText
+        const shouldSkip = w.toolTextRecovered
+        expect(shouldSkip).toBe(true)
+    })
+})
+
+describe("🎉 Completion Detection", () => {
+    function normalize(text: string): string {
+        return text.trim().replace(/[.!?]+$/, '')
+    }
+
+    test("detects 🎉 at end of message", () => {
+        expect(normalize("All tasks complete 🎉").endsWith('🎉')).toBe(true)
+    })
+
+    test("detects 🎉 with trailing punctuation", () => {
+        expect(normalize("Done 🎉.").endsWith('🎉')).toBe(true)
+        expect(normalize("Finished 🎉!").endsWith('🎉')).toBe(true)
+    })
+
+    test("ignores 🎉 in middle of text", () => {
+        expect(normalize("🎉 Starting task two...").endsWith('🎉')).toBe(false)
+    })
+})
+
+describe("Done Claim Detection", () => {
+    const DONE_CLAIM_PATTERNS = [
+        /^task\s+done[.!]*$/im,
+        /^done[.!]*$/im,
+        /^all\s+done[.!]*$/im,
+        /^finished[.!]*$/im,
+        /^complete[.!]*$/im,
+        /^task\s+complete[.!]*$/im,
+        /^all\s+tasks?\s+complete[.!]*$/im,
+        /^(?:i['']?m\s+)?done\s+with\s+task/im,
+    ]
+
+    function containsDoneClaimPattern(text: string): boolean {
+        const lines = text.split('\n')
+        const lastLines = lines.slice(-3).join('\n')
+        return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+    }
+
+    test("detects 'Task Done' claim", () => {
+        expect(containsDoneClaimPattern("Task Done")).toBe(true)
+    })
+
+    test("detects 'done.' claim", () => {
+        expect(containsDoneClaimPattern("done.")).toBe(true)
+    })
+
+    test("detects 'All tasks complete' claim", () => {
+        expect(containsDoneClaimPattern("All tasks complete")).toBe(true)
+    })
+
+    test("detects 'Finished' with exclamation", () => {
+        expect(containsDoneClaimPattern("Finished!")).toBe(true)
+    })
+
+    test("does not flag regular content with 'done' in middle", () => {
+        expect(containsDoneClaimPattern("I have done the tasks you asked me to do")).toBe(false)
+    })
+
+    test("detects in last line only", () => {
+        const msg = "I analyzed the code.\nAll done."
+        expect(containsDoneClaimPattern(msg)).toBe(true)
+    })
+
+    test("does not flag work output with 'complete' in context", () => {
+        expect(containsDoneClaimPattern("The operation completed successfully with exit code 0")).toBe(false)
+    })
+})

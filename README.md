@@ -25,6 +25,8 @@ _( [#55](https://github.com/anomalyco/opencode/issues/55), [#221](https://github
 
 **ESC cancel** — user presses ESC to cancel a request. The plugin detects `MessageAbortedError` and marks all busy sessions as cancelled, never resuming them.
 
+**Explicit completion via `task_complete`** — the agent can call the built-in `task_complete` tool to signal that all work is done. When invoked, the plugin stops sending any further "continue" prompts, clears all pending timers, and marks the session as complete. This replaces fragile text-based heuristics (emoji patterns, language detection) with a deterministic signal.
+
 **Spurious error messages** — after normal completion, OpenCode sometimes fires a `session.error`. All logging goes through `ctx.client.app.log()` (zero `console.log`), and errors on already-idle sessions are silently ignored.
 _( [#128](https://github.com/anomalyco/opencode/pulls/128), [#22](https://github.com/anomalyco/opencode/pulls/22) )_
 

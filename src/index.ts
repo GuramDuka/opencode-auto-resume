@@ -35,6 +35,8 @@ interface SessionWatch {
     todos: Todo[]
     todoCheckAttempts: number
     toolTextTimer: ReturnType<typeof setTimeout> | null
+    checkingToolText: boolean
+    lastSubagentCheckAt: number
 }
 
 // ---------------------------------------------------------------------------
@@ -53,7 +55,7 @@ const DEFAULT_LOOP_MAX_CONTINUES = 3
 const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
 
 /** Delay after session goes idle before checking for tool-call-as-text. */
-const TOOL_TEXT_CHECK_DELAY_MS = 1_500
+const TOOL_TEXT_CHECK_DELAY_MS = 3_000
 
 /** Max idle sessions to keep in memory before cleanup. */
 const MAX_IDLE_SESSIONS = 50
@@ -149,6 +151,33 @@ function containsReadyToContinuePattern(text: string): boolean {
     return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
+/**
+ * Patterns for shallow "task done" claims where the model says it finished
+ * but didn't actually do the work (common with Mistral models).
+ */
+const DONE_CLAIM_PATTERNS = [
+    /^task\s+done[.!]*$/im,
+    /^done[.!]*$/im,
+    /^all\s+done[.!]*$/im,
+    /^finished[.!]*$/im,
+    /^complete[.!]*$/im,
+    /^task\s+complete[.!]*$/im,
+    /^all\s+tasks?\s+complete[.!]*$/im,
+    /^(?:i['']?m\s+)?done\s+with\s+task/im,
+]
+
+/** Prompt for when the model claims to be done but likely didn't complete the work. */
+const DONE_WITHOUT_WORK_PROMPT =
+    "I need you to verify more carefully that you have actually completed all the required tasks. " +
+    "Your response indicated you're done, but no work was detected. Please check your todo list " +
+    "and complete any remaining work."
+
+function containsDoneClaimPattern(text: string): boolean {
+    const lines = text.split('\n')
+    const lastLines = lines.slice(-3).join('\n')
+    return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -238,6 +267,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 todos: [],
                 todoCheckAttempts: 0,
                 toolTextTimer: null,
+                checkingToolText: false,
+                lastSubagentCheckAt: 0,
             }
             sessions.set(sid, w)
         }
@@ -431,9 +462,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
         } finally {
             w.continuing = false
-        w.todoCheckAttempts = 0
-        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+            w.todoCheckAttempts = 0
+            if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
         }
+        // Deferred check: verify the session went busy after prompt
+        setTimeout(async () => {
+            if (w.status !== "busy") {
+                await log("warn", `${short(sid)} - prompt sent >${TOOL_TEXT_CHECK_DELAY_MS / 1000}s ago but session is still ${w.status}`)
+            }
+        }, TOOL_TEXT_CHECK_DELAY_MS)
     }
 
     function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -527,6 +564,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.idleSince = null
         w.continuing = false
         w.todoCheckAttempts = 0
+        w.checkingToolText = false
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
     }
 
@@ -546,6 +584,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         if (typeof sid !== "string" || !sid) return
         if (w.userCancelled || w.toolTextRecovered) return
         if (w.status !== "idle") return
+        if (w.checkingToolText) return
+        w.checkingToolText = true
 
         // v8.0: Backoff for tool-text recovery
         if (w.toolTextAttempts > 0) {
@@ -636,8 +676,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                         
                         const candidate = {
-                            prompt: "continue",
-                            source: "ready-to-continue",
+                            prompt: containsDoneClaimPattern(text)
+                                ? DONE_WITHOUT_WORK_PROMPT
+                                : "continue",
+                            source: containsDoneClaimPattern(text)
+                                ? "done-claim"
+                                : "ready-to-continue",
                             priority: 1,
                         }
                         if (!bestCandidate || candidate.priority < bestCandidate.priority) {
@@ -645,6 +689,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
                 }
+            }
+
+            // Completion check: 🎉 overrides ready-to-continue but not tool-call-as-text
+            const trimmedText = allAssistantText.trim()
+            const normalized = trimmedText.replace(/[.!?]+$/, '')
+            if (normalized.endsWith('🎉') && (!bestCandidate || bestCandidate.priority > 0)) {
+                await log("info", `${short(sid)} - 🎉 completion detected, skipping continue`)
+                w.toolTextRecovered = true
+                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                return
             }
 
             if (!bestCandidate) return
@@ -680,6 +734,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             log("debug", `${short(sid)} - could not fetch messages: ${errMsg}`)
+        } finally {
+            w.checkingToolText = false
         }
     }
 
@@ -832,6 +888,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                 if (numBusy > 1) continue
 
+                // Cooldown: only check subagent status every 10s to avoid redundant API calls
+                if (now - w.lastSubagentCheckAt < checkIntervalMs * 2) continue
+                w.lastSubagentCheckAt = now
+
                 if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
                     const subStatus = await checkSubagentStatus(sid)
                     if (subStatus.status === "idle" || subStatus.status === "unknown") {
@@ -921,6 +981,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     // v8.0: TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
@@ -953,6 +1014,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     // v8.0: Also check for tool-call-as-text on legacy idle event
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
@@ -1013,6 +1075,24 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     // -----------------------------------------------------------------------
+    // task_complete tool
+    // -----------------------------------------------------------------------
+
+    const taskCompleteTool = tool({
+        description: "Signal that all work is complete. Call this when you have finished everything requested.",
+        args: {},
+        execute: async (_args, ctx) => {
+            const w = sessions.get(ctx.sessionID)
+            if (w) {
+                w.toolTextRecovered = true
+                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                log("info", `${short(ctx.sessionID)} - task_complete called, agent done`)
+            }
+            return "Task completion acknowledged. No further continuation will be sent."
+        },
+    })
+
+    // -----------------------------------------------------------------------
     // Returned hooks
     // -----------------------------------------------------------------------
 
@@ -1035,6 +1115,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     duration: 5000
                 })
             }
+        },
+        tool: {
+            "task_complete": taskCompleteTool,
         },
     }
 }
