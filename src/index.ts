@@ -308,12 +308,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     function getSid(ev: Record<string, unknown>): string | undefined {
         const props = ev.properties as Record<string, unknown> | undefined
-        return (
+        const sid = (
             (ev.sessionID as string | undefined) ??
             (props?.sessionID as string | undefined) ??
             ((props?.part as Record<string, unknown>)?.sessionID as string | undefined) ??
             ((props?.info as Record<string, unknown>)?.sessionID as string | undefined)
         )
+        // Validate sid format: must be a non-empty string starting with "ses_"
+        if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
+            return sid
+        }
+        return undefined
     }
 
     function getError(ev: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -755,7 +760,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
 
         try {
-            await ctx.client.session.abort({ sessionID: sid })
+            await ctx.client.session.abort({ path: { id: sid } })
             await log("info", `${short(sid)} - abort OK`)
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
@@ -825,7 +830,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             for (const s of list) {
                 const sid = s.id as string
-                if (sid) {
+                if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
                     const isNew = !sessions.has(sid)
                     ensureWatch(sid)
                     const status = s.status as string | undefined
