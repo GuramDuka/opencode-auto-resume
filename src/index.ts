@@ -37,6 +37,7 @@ interface SessionWatch {
     toolTextTimer: ReturnType<typeof setTimeout> | null
     checkingToolText: boolean
     lastSubagentCheckAt: number
+    interruptedContinueCount: number // Track consecutive interrupted continues
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,12 @@ const TOOL_TEXT_PATTERNS = [
     /<par(?:a|am|ame|amet|amete|ameter)?$/im,
     // XML tool blocks with common tool names
     /<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
+    // JSON-style tool calls (common in some models)
+    /{"type":\s*"function"/i,
+    /{"name":\s*"[a-zA-Z_]/i,
+    // Truncated JSON
+    /\{\s*"type"\s*:?$/im,
+    /\{\s*"name"\s*:?$/im,
 ]
 
 /** Patterns for truncated XML (opened but never closed in the same text). */
@@ -107,6 +114,9 @@ const TRUNCATED_XML_PATTERNS = [
     { open: /<function[^>]*>/i, close: /<\/function>/i },
     { open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
     { open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
+    // JSON-style truncated tool calls
+    { open: /\{\s*"type"\s*:/i, close: /}/ },
+    { open: /\{\s*"name"\s*:/i, close: /}/ },
 ]
 
 /**
@@ -269,6 +279,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 toolTextTimer: null,
                 checkingToolText: false,
                 lastSubagentCheckAt: 0,
+                interruptedContinueCount: 0,
             }
             sessions.set(sid, w)
         }
@@ -570,6 +581,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.continuing = false
         w.todoCheckAttempts = 0
         w.checkingToolText = false
+        w.interruptedContinueCount = 0 // Reset interrupted continue counter on new activity
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
     }
 
@@ -633,17 +645,36 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const partType = part.type as string
                     let text = ""
                     let isReasoning = false
+                    let isToolUse = false
 
                     if (partType === "text") {
                         text = (part.text as string) ?? ""
                     } else if (partType === "reasoning") {
                         text = (part.text as string) ?? ""
                         isReasoning = true
+                    } else if (partType === "tool_use") {
+                        // Tool use part detected - model is trying to execute a tool
+                        // This counts as "ready to continue" since the model wants to do work
+                        isToolUse = true
+                        const toolName = (part.name as string) ?? "unknown"
+                        text = `tool_use: ${toolName}`
                     } else {
                         continue
                     }
 
                     allAssistantText += text + "\n"
+
+                    // Tool use parts indicate the model wants to execute something
+                    if (isToolUse) {
+                        const candidate = {
+                            prompt: "continue",
+                            source: "tool-use",
+                            priority: 1,
+                        }
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
+                    }
 
                     if (containsToolCallAsText(text)) {
                         const candidate = {
@@ -951,7 +982,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     // Event handler
     // -----------------------------------------------------------------------
 
-    function handleEvent(ev: Record<string, unknown>) {
+    async function handleEvent(ev: Record<string, unknown>) {
         const type = ev.type as string
         const sid = getSid(ev)
 
@@ -972,7 +1003,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     w.lastActivityAt = Date.now()
                     resetSessionFlags(w)
                     log("debug", `${short(sid)} -> busy (${busyCount()})`)
-                } else if (statusType === "idle") {
+                } else if (statusType === "idle" || statusType === "interrupted") {
                     w.status = "idle"
                     resetIdleFlags(w)
 
@@ -985,14 +1016,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
                     prevBusyCount = currentBusy
-                    log("debug", `${short(sid)} -> idle (${currentBusy})`)
+                    log("debug", `${short(sid)} -> idle (${currentBusy})${statusType === "interrupted" ? " (interrupted)" : ""}`)
 
                     // v8.0: TOOL-CALL-AS-TEXT CHECK — runs regardless of busyCount
                     if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
                         if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+                        // If interrupted, check immediately (no delay) since generation was cut off
+                        const checkDelay = statusType === "interrupted" ? 500 : TOOL_TEXT_CHECK_DELAY_MS
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
-                        }, TOOL_TEXT_CHECK_DELAY_MS)
+                        }, checkDelay)
                     }
                 } else if (statusType === "retry") {
                     touchSession(sid)
@@ -1026,6 +1059,47 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         w.toolTextTimer = setTimeout(() => {
                             checkForToolCallAsText(sid, w)
                         }, TOOL_TEXT_CHECK_DELAY_MS)
+                    }
+                }
+                break
+            }
+
+            case "session.interrupted": {
+                if (!sid) break
+                const w = sessions.get(sid)
+                if (w) {
+                    const wasJustContinued = w.continuing || (Date.now() - w.lastRetryAt < 2000)
+                    
+                    w.status = "idle"
+                    resetIdleFlags(w)
+                    log("debug", `${short(sid)} -> interrupted${wasJustContinued ? " (after continue)" : ""}`)
+
+                    // If we just sent a continue and it got interrupted, retry immediately
+                    // But limit to 3 consecutive interrupted continues to prevent infinite loops
+                    if (wasJustContinued && w.interruptedContinueCount < 3 && !w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                        w.interruptedContinueCount++
+                        await log("info", `${short(sid)} - continue was interrupted (${w.interruptedContinueCount}/3), retrying...`)
+                        w.continuing = false // Reset flag so we can send again
+                        try {
+                            await sendContinuePrompt(sid, "continue", w)
+                            await log("info", `${short(sid)} - interrupted continue retried`)
+                        } catch (err) {
+                            const errMsg = err instanceof Error ? err.message : String(err)
+                            await log("warn", `${short(sid)} - interrupted continue retry failed: ${errMsg}`)
+                        }
+                        return // Don't schedule another check
+                    } else if (wasJustContinued && w.interruptedContinueCount >= 3) {
+                        await log("warn", `${short(sid)} - too many interrupted continues (${w.interruptedContinueCount}), stopping retries`)
+                        w.interruptedContinueCount = 0 // Reset counter
+                        // Fall through to normal tool-text check
+                    }
+
+                    // Check immediately for tool calls that were cut off
+                    if (!w.toolTextRecovered && w.toolTextAttempts < maxRetries) {
+                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+                        w.toolTextTimer = setTimeout(() => {
+                            checkForToolCallAsText(sid, w)
+                        }, 500)
                     }
                 }
                 break
