@@ -18,6 +18,11 @@ interface Todo {
     priority: "high" | "medium" | "low"
 }
 
+interface ToolCallRecord {
+    toolName: string
+    at: number
+}
+
 interface SessionWatch {
     lastActivityAt: number
     status: "busy" | "idle" | "retry" | "unknown"
@@ -37,7 +42,9 @@ interface SessionWatch {
     toolTextTimer: ReturnType<typeof setTimeout> | null
     checkingToolText: boolean
     lastSubagentCheckAt: number
-    interruptedContinueCount: number // Track consecutive interrupted continues
+    interruptedContinueCount: number
+    recentToolCalls: ToolCallRecord[]
+    toolLoopAttempts: number
 }
 
 // ---------------------------------------------------------------------------
@@ -77,52 +84,47 @@ const THINKING_TOOL_RECOVERY_PROMPT =
     "I noticed you have a tool call generated in your thinking/reasoning. " +
     "Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
 
+/** Recovery prompt for tool call loops (same tool called repeatedly without progress). */
+const TOOL_LOOP_RECOVERY_PROMPT =
+    "I notice you've been calling the same tool multiple times in a row without making progress. " +
+    "Please step back and reassess your approach. Consider: " +
+    "1) Are you stuck in a loop? 2) Do you need different information first? " +
+    "3) Should you try a different tool or break the task into smaller steps? " +
+    "Take a moment to think about what's blocking you and propose a different strategy."
+
 // ---------------------------------------------------------------------------
 // Patterns that indicate a tool call was printed as text, not executed.
 // Expanded to cover truncated tags, alternative formats, and partial XML.
 // ---------------------------------------------------------------------------
 
 const TOOL_TEXT_PATTERNS = [
-    // Standard Anthropic-style function tags
     /<function\s*=/i,
     /<function>/i,
     /<\/function>/i,
     /<parameter\s*=/i,
     /<parameter>/i,
     /<\/parameter>/i,
-    // Alternative tool call formats
     /<tool_call[\s>]/i,
     /<\/tool_call>/i,
     /<tool[\s_]name\s*=/i,
     /<invoke\s+/i,
-    // Truncated/incomplete tags (generation cut off mid-tag)
     /<func(?:t|ti|tio|tion)?$/im,
     /<par(?:a|am|ame|amet|amete|ameter)?$/im,
-    // XML tool blocks with common tool names
     /<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
-    // JSON-style tool calls (common in some models)
     /{"type":\s*"function"/i,
     /{"name":\s*"[a-zA-Z_]/i,
-    // Truncated JSON
     /\{\s*"type"\s*:?$/im,
     /\{\s*"name"\s*:?$/im,
 ]
 
-/** Patterns for truncated XML (opened but never closed in the same text). */
 const TRUNCATED_XML_PATTERNS = [
-    // Opening tag without matching close (within reasonable text length)
     { open: /<function[^>]*>/i, close: /<\/function>/i },
     { open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
     { open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
-    // JSON-style truncated tool calls
     { open: /\{\s*"type"\s*:/i, close: /}/ },
     { open: /\{\s*"name"\s*:/i, close: /}/ },
 ]
 
-/**
- * Patterns that indicate the agent is waiting to continue but didn't actually send the continue prompt.
- * These appear at the end of assistant messages when the model says it will continue but doesn't.
- */
 const READY_TO_CONTINUE_PATTERNS = [
     /ready to continue with task/i,
     /continuing with task/i,
@@ -135,36 +137,21 @@ const READY_TO_CONTINUE_PATTERNS = [
 
 function containsToolCallAsText(text: string): boolean {
     if (text.length <= 10) return false
-
-    // Check direct pattern matches
     if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(text))) return true
-
-    // Check for truncated XML: opening tag present but no closing tag
     for (const { open, close } of TRUNCATED_XML_PATTERNS) {
         if (open.test(text) && !close.test(text)) return true
     }
-
     return false
 }
 
-/**
- * Check if the last line of the message contains "ready to continue" patterns.
- * These indicate the model says it will continue but doesn't actually send the prompt.
- */
 function containsReadyToContinuePattern(text: string): boolean {
     const lines = text.split('\n')
     const lastLine = lines[lines.length - 1]?.trim()
     if (!lastLine) return false
-    
-    // Check only last 3 lines for the pattern (model usually says it at the end)
     const lastLines = lines.slice(-3).join('\n')
     return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
 }
 
-/**
- * Patterns for shallow "task done" claims where the model says it finished
- * but didn't actually do the work (common with Mistral models).
- */
 const DONE_CLAIM_PATTERNS = [
     /^task\s+done[.!]*$/im,
     /^done[.!]*$/im,
@@ -178,7 +165,6 @@ const DONE_CLAIM_PATTERNS = [
     /^(?:i['']?m\s+)?done\s+with\s+task/im,
 ]
 
-/** Prompt for when the model claims to be done but likely didn't complete the work. */
 const DONE_WITHOUT_WORK_PROMPT =
     "I need you to verify more carefully that you have actually completed all the required tasks. " +
     "Your response indicated you're done, but no work was detected. Please check your todo list " +
@@ -241,18 +227,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return w.continueTimestamps.length >= loopMaxContinues
     }
 
-    // -----------------------------------------------------------------------
-    // Logging
-    // -----------------------------------------------------------------------
-
     async function log(level: "debug" | "info" | "warn" | "error", msg: string) {
         try {
-            await ctx.client.app.log({
-                body: { service: "auto-resume", level, message: msg },
-            })
-        } catch {
-            // NEVER console.log
-        }
+            await ctx.client.app.log({ body: { service: "auto-resume", level, message: msg } })
+        } catch { /* ignore */ }
     }
 
     // -----------------------------------------------------------------------
@@ -282,20 +260,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 checkingToolText: false,
                 lastSubagentCheckAt: 0,
                 interruptedContinueCount: 0,
+                recentToolCalls: [],
+                toolLoopAttempts: 0,
             }
             sessions.set(sid, w)
         }
         return w
     }
 
-    /** Only touch the specific session that emitted the event.
-     *  Previously this reset ALL busy sessions, masking real stalls
-     *  when a subagent was active. */
     function touchSession(sid: string) {
         const w = sessions.get(sid)
         if (w && w.status === "busy" && !w.userCancelled) {
             w.lastActivityAt = Date.now()
-            // Don't reset resumeAttempts here — only reset on new busy status
         }
     }
 
@@ -327,7 +303,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             ((props?.part as Record<string, unknown>)?.sessionID as string | undefined) ??
             ((props?.info as Record<string, unknown>)?.sessionID as string | undefined)
         )
-        // Validate sid format: must be a non-empty string starting with "ses_"
         if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
             return sid
         }
@@ -584,6 +559,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.todoCheckAttempts = 0
         w.checkingToolText = false
         w.interruptedContinueCount = 0 // Reset interrupted continue counter on new activity
+        w.recentToolCalls = [] // Clear tool call history on new activity
+        w.toolLoopAttempts = 0
         if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
     }
 
@@ -594,12 +571,56 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.idleSince = Date.now()
     }
 
-    // -----------------------------------------------------------------------
-    // Tool-call-as-text detection: no busyCount guard, backoff,
-    // specific recovery prompt)
-    // -----------------------------------------------------------------------
+    /**
+     * Detect repeating patterns in tool calls (not just consecutive same tool).
+     * Examples:
+     * - A-B-A-B-A-B (pattern length 2)
+     * - A-B-C-A-B-C-A-B-C (pattern length 3)
+     * - edit-read-edit-read-edit-read
+     */
+    function detectPatternLoop(recentTools: string[]): boolean {
+        if (recentTools.length < 6) return false // Need at least 6 calls to detect a pattern
+        
+        // Try different pattern lengths (2, 3, 4, 5)
+        for (const patternLen of [2, 3, 4, 5]) {
+            if (recentTools.length < patternLen * 3) continue // Need 3 repetitions
+            
+            // Extract the potential pattern from the most recent calls
+            const pattern = recentTools.slice(-patternLen)
+            
+            // Check if previous calls match this pattern (at least 2 more repetitions)
+            let matches = 0
+            for (let i = recentTools.length - patternLen * 2; i >= 0; i -= patternLen) {
+                const slice = recentTools.slice(i, i + patternLen)
+                if (slice.length !== patternLen) break
+                
+                const isMatch = slice.every((tool, idx) => tool === pattern[idx])
+                if (!isMatch) break
+                
+                matches++
+            }
+            
+            if (matches >= 2) return true
+        }
+        return false
+    }
 
-        async function checkForToolCallAsText(sid: string, w: SessionWatch) {
+    function trackToolCall(w: SessionWatch, toolName: string): boolean {
+        const now = Date.now()
+        w.recentToolCalls = w.recentToolCalls.filter(call => now - call.at < 120_000)
+        w.recentToolCalls.push({ toolName, at: now })
+        
+        const recentTools = w.recentToolCalls.slice(-15).map(call => call.toolName)
+        if (recentTools.length < 6) return false
+        
+        const lastTool = recentTools[recentTools.length - 1]
+        const consecutiveSame = recentTools.slice(-5).filter(tool => tool === lastTool).length
+        if (consecutiveSame >= 3) return true
+        
+        return detectPatternLoop(recentTools)
+    }
+
+    async function checkForToolCallAsText(sid: string, w: SessionWatch) {
         if (typeof sid !== "string" || !sid) return
         if (w.userCancelled || w.toolTextRecovered) return
         if (w.status !== "idle") return
@@ -640,6 +661,27 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const rawRole = (msg.role ?? (msg.info as Record<string, unknown> | undefined)?.role) as string | undefined
                 if (rawRole !== "assistant") continue
 
+                // Track tool calls from tool_call / tool_calls fields (not just parts)
+                const toolCall = msg.toolCall as Record<string, unknown> | undefined
+                if (toolCall && typeof toolCall === "object" && "name" in toolCall) {
+                    const toolName = toolCall.name as string
+                    if (toolName) {
+                        trackToolCall(w, toolName)
+                    }
+                }
+                
+                const toolCalls = msg.tool_calls as Array<Record<string, unknown>> | undefined
+                if (toolCalls) {
+                    for (const tc of toolCalls) {
+                        if (typeof tc === "object" && "name" in tc) {
+                            const toolName = tc.name as string
+                            if (toolName) {
+                                trackToolCall(w, toolName)
+                            }
+                        }
+                    }
+                }
+
                 const parts = msg.parts as Array<Record<string, unknown>> | undefined
                 if (!parts) continue
 
@@ -668,13 +710,29 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     // Tool use parts indicate the model wants to execute something
                     if (isToolUse) {
-                        const candidate = {
-                            prompt: "continue",
-                            source: "tool-use",
-                            priority: 1,
-                        }
-                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
-                            bestCandidate = candidate
+                        // Track this tool call for loop detection
+                        const isLoop = trackToolCall(w, toolName)
+                        
+                        if (isLoop && w.toolLoopAttempts < 2) {
+                            // Tool loop detected! Send recovery prompt
+                            w.toolLoopAttempts++
+                            const candidate = {
+                                prompt: TOOL_LOOP_RECOVERY_PROMPT,
+                                source: "tool-loop",
+                                priority: 0, // Highest priority
+                            }
+                            if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                bestCandidate = candidate
+                            }
+                        } else {
+                            const candidate = {
+                                prompt: "continue",
+                                source: "tool-use",
+                                priority: 1,
+                            }
+                            if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                bestCandidate = candidate
+                            }
                         }
                     }
 
@@ -756,18 +814,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
 
             // AUTO-CONTINUE when todos exist and are open, but model just stopped
+            // BUT only if this is the ONLY busy session (no subagents running)
             if (!bestCandidate) {
                 const todos = w.todos || []
                 const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                 
-                if (hasOpenTodos) {
+                if (hasOpenTodos && busyCount() === 1) {
                     // Model stopped without any signal, but work remains
+                    // Only trigger if this is the lone busy session (no subagents active)
                     await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending continue...`)
                     bestCandidate = {
                         prompt: "continue",
                         source: "idle-with-open-todos",
                         priority: 2,
                     }
+                } else if (hasOpenTodos && busyCount() > 1) {
+                    await log("debug", `${short(sid)} - todos remain open but ${busyCount()} sessions busy (subagents running), skipping continue`)
                 }
             }
 
