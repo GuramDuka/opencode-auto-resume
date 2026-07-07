@@ -177,10 +177,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     let initialised = false
     let prevBusyCount = 0
 
-    // -----------------------------------------------------------------
-    // Per-session hallucination loop detection
-    // -----------------------------------------------------------------
-
     function recordContinue(sid: string): void {
         const w = sessions.get(sid)
         if (!w) return
@@ -203,10 +199,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await ctx.client.app.log({ body: { service: "auto-resume", level, message: msg } })
         } catch { /* ignore */ }
     }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
 
     function ensureWatch(sid: string): SessionWatch {
         let w = sessions.get(sid)
@@ -320,7 +312,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
         }
 
-        // Also prune if too many idle sessions
         if (idleCount > MAX_IDLE_SESSIONS) {
             const idleEntries: Array<{ sid: string; idleSince: number }> = []
             for (const [sid, w] of sessions) {
@@ -351,10 +342,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             return
         }
         w.continuing = true
+        
+        let agent: string | undefined
+        let model: { providerID: string; modelID: string } | undefined
+        
         try {
-            let agent: string | undefined
-            let model: { providerID: string; modelID: string } | undefined
-
             const msgResp = await ctx.client.session.messages({ path: { id: sid } })
             const msgs = extractMessages(msgResp as Record<string, unknown>)
 
@@ -464,6 +456,52 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
     }
 
+    async function hasBusySubagents(parentSid: string): Promise<boolean> {
+        try {
+            const response = await ctx.client.session.list()
+            const allSessions = extractMessages(response as Record<string, unknown>)
+
+            for (const s of allSessions) {
+                const sId = s.id as string
+                if (!sId || sId === parentSid) continue
+                const status = s.status as string | undefined
+                if (status === "busy") return true
+            }
+            return false
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `hasBusySubagents failed for ${short(parentSid)}: ${errMsg}`)
+            return false
+        }
+    }
+
+    async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
+        try {
+            const response = await ctx.client.session.messages({ path: { id: sid } })
+            const messages = extractMessages(response as Record<string, unknown>)
+            const lastMsg = messages[messages.length - 1]
+            
+            if (!lastMsg) return false
+            
+            const rawRole = (lastMsg?.role ?? (lastMsg?.info as Record<string, unknown> | undefined)?.role) as string | undefined
+            if (rawRole !== "assistant") return false
+            
+            const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
+            const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
+            const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
+            
+            const hasToolCall = toolCall !== undefined
+                || (toolCalls?.length ?? 0) > 0
+                || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call" || p.type === "tool_use") ?? false)
+            
+            return hasToolCall
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `checkSessionHasActiveTool failed for ${short(sid)}: ${errMsg}`)
+            return false
+        }
+    }
+
     async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
         try {
             const response = await ctx.client.session.list()
@@ -487,14 +525,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     const rawRole = (lastMsg?.role ?? (lastMsg?.info as Record<string, unknown> | undefined)?.role) as string | undefined
                     if (lastMsg && rawRole === "assistant" && ("error" in lastMsg || (lastMsg.info && "error" in (lastMsg.info as Record<string, unknown>)))) {
                         await log("debug", `Subagent ${short(sId)} appears crashed`)
-                        return "crashed"
+                        return { status: "crashed" }
                     }
 
                     const msgTime = (lastMsg?.time as Record<string, number> | undefined)?.created ?? (lastMsg?.time as number | undefined)
-                    const hasToolCall = (lastMsg?.toolCall as Record<string, unknown> | undefined) !== undefined
-                        || (lastMsg?.tool_calls as Record<string, unknown> | undefined) !== undefined
-                        || (lastMsg?.parts as Record<string, unknown> | undefined)?.some((p: Record<string, unknown>) => p.type === "tool-call")
-                        !== undefined
+                    if (!msgTime) continue
+                    
+                    const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
+                    const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
+                    const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
+                    const hasToolCall = toolCall !== undefined
+                        || (toolCalls?.length ?? 0) > 0
+                        || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call") ?? false)
+                    
                     const isStuck = hasToolCall
                         ? now - msgTime > SUBAGENT_STUCK_MS * 3
                         : now - msgTime > SUBAGENT_STUCK_MS
@@ -523,7 +566,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         w.gaveUp = false
         w.orphanWatchStartAt = null
         w.aborting = false
-        // Only reset toolTextRecovered for subagents - parent sessions keep it if set
         if (w.isSubagent) {
             w.toolTextRecovered = false
         }
@@ -556,14 +598,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     function detectPatternLoop(recentTools: string[]): boolean {
         if (recentTools.length < 6) return false // Need at least 6 calls to detect a pattern
         
-        // Try different pattern lengths (2, 3, 4, 5)
         for (const patternLen of [2, 3, 4, 5]) {
-            if (recentTools.length < patternLen * 3) continue // Need 3 repetitions
+            if (recentTools.length < patternLen * 3) continue
             
-            // Extract the potential pattern from the most recent calls
             const pattern = recentTools.slice(-patternLen)
             
-            // Check if previous calls match this pattern (at least 2 more repetitions)
             let matches = 0
             for (let i = recentTools.length - patternLen * 2; i >= 0; i -= patternLen) {
                 const slice = recentTools.slice(i, i + patternLen)
@@ -609,7 +648,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (elapsed < requiredBackoff) return
         }
 
-        // Cap tool-text attempts like regular retries
         if (w.toolTextAttempts >= maxRetries) return
 
         await log("debug", `${short(sid)} - checking for tool-call-as-text (attempt ${w.toolTextAttempts + 1})`)
@@ -621,13 +659,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             const messages = extractMessages(response as Record<string, unknown>)
             const recent = messages.slice(-3)
 
-            // Prioritise tool-call-as-text in reasoning over ready-to-continue
-            // in text parts: collect all candidates first, then act on the
-            // highest-priority one.
             let bestCandidate: {
                 prompt: string
                 source: string
-                priority: number // lower = higher priority
+                priority: number
             } | null = null
 
             let allAssistantText = ""
@@ -672,8 +707,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         text = (part.text as string) ?? ""
                         isReasoning = true
                     } else if (partType === "tool_use") {
-                        // Tool use part detected - model is trying to execute a tool
-                        // This counts as "ready to continue" since the model wants to do work
                         isToolUse = true
                         const toolName = (part.name as string) ?? "unknown"
                         text = `tool_use: ${toolName}`
@@ -683,18 +716,16 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
                     allAssistantText += text + "\n"
 
-                    // Tool use parts indicate the model wants to execute something
                     if (isToolUse) {
-                        // Track this tool call for loop detection
+                        const toolName = (part.name as string) ?? "unknown"
                         const isLoop = trackToolCall(w, toolName)
                         
                         if (isLoop && w.toolLoopAttempts < 2) {
-                            // Tool loop detected! Send recovery prompt
                             w.toolLoopAttempts++
                             const candidate = {
                                 prompt: TOOL_LOOP_RECOVERY_PROMPT,
                                 source: "tool-loop",
-                                priority: 0, // Highest priority
+                                priority: 0,
                             }
                             if (!bestCandidate || candidate.priority < bestCandidate.priority) {
                                 bestCandidate = candidate
@@ -794,7 +825,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
 
-            // Completion check: 🎉 overrides ready-to-continue but not tool-call-as-text
             const trimmedText = allAssistantText.trim()
             const normalized = trimmedText.replace(/[.!?]+$/, '')
             if (normalized.endsWith('🎉') && (!bestCandidate || bestCandidate.priority > 0)) {
@@ -804,15 +834,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 return
             }
 
-            // AUTO-CONTINUE when todos exist and are open, but model just stopped
-            // BUT only if this is the ONLY busy session (no subagents running)
             if (!bestCandidate) {
                 const todos = w.todos || []
                 const hasOpenTodos = todos.some(t => t.status === "pending" || t.status === "in_progress")
                 
                 if (hasOpenTodos && busyCount() === 1) {
-                    // Model stopped without any signal, but work remains
-                    // Only trigger if this is the lone busy session (no subagents active)
                     await log("info", `${short(sid)} - no activity detected but todos remain open (${todos.filter(t => t.status === "pending" || t.status === "in_progress").length} tasks). Sending continue...`)
                     bestCandidate = {
                         prompt: "continue",
@@ -997,8 +1023,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                     tryAbortAndResume(sid, w)
                                 }
                             } else if (subStatus.status === "idle") {
-                                await log("info", `All subagents idle, parent ${short(sid)} stuck. Triggering abort+resume.`)
-                                tryAbortAndResume(sid, w)
+                                const hasBusySub = await hasBusySubagents(sid)
+                                if (hasBusySub) {
+                                    await log("debug", `Subagents exist but not busy yet, waiting for startup...`)
+                                } else {
+                                    await log("info", `Parent ${short(sid)} stuck with no active subagents. Triggering abort+resume.`)
+                                    tryAbortAndResume(sid, w)
+                                }
                             } else {
                                 await log("debug", `Subagent still running, waiting...`)
                             }
@@ -1019,6 +1050,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 w.lastSubagentCheckAt = now
 
                 if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
+                    // Check if main session has an active tool call - if so, don't abort
+                    // Long-running tools (aft_edit, bash, etc.) don't fire SSE events but are still working
+                    const hasActiveTool = await checkSessionHasActiveTool(sid)
+                    if (hasActiveTool) {
+                        await log("debug", `Parent ${short(sid)} has active tool call, skipping abort check`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+
                     const subStatus = await checkSubagentStatus(sid)
                     if (subStatus.status === "idle" || subStatus.status === "unknown") {
                         await log("info", `Parent ${short(sid)} stuck with no active subagents. Triggering abort+resume.`)
@@ -1289,14 +1329,6 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
         config: async () => {
             log("info", `opencode-auto-resume config OK`)
-            if (ctx.ui && typeof ctx.ui.toast === "function") {
-                ctx.ui.toast({
-                    title: "Auto-Resume Plugin",
-                    message: `Loaded with ${chunkTimeoutMs}ms timeout, ${loopMaxContinues} loop attempts`,
-                    variant: "success",
-                    duration: 5000
-                })
-            }
         },
         tool: {
             "task_complete": taskCompleteTool,
