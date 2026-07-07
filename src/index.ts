@@ -477,6 +477,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
         try {
+            // First check: if the session itself is busy, it's likely executing a tool
+            const listResponse = await ctx.client.session.list()
+            const sessions = extractMessages(listResponse as Record<string, unknown>)
+            const currentSession = sessions.find((s: Record<string, unknown>) => s.id === sid)
+            const status = currentSession?.status as string | undefined
+            
+            if (status === "busy") {
+                await log("debug", `Session ${short(sid)} is busy, likely executing a tool`)
+                return true
+            }
+            
+            // Second check: look for toolCall in recent messages (for edge cases)
             const response = await ctx.client.session.messages({ path: { id: sid } })
             const messages = extractMessages(response as Record<string, unknown>)
             const lastMsg = messages[messages.length - 1]
