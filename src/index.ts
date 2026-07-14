@@ -40,6 +40,8 @@ interface SessionWatch {
     recentToolCalls: ToolCallRecord[]
     toolLoopAttempts: number
     isSubagent: boolean
+    /** Cached result of model filter check. null = not yet checked. */
+    modelAllowed: boolean | null
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -170,6 +172,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     (options?.loopMaxContinues as number) ?? DEFAULT_LOOP_MAX_CONTINUES
     const loopWindowMs: number =
     (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
+    const modelFilter: RegExp | null =
+    typeof options?.modelFilter === "string" && options.modelFilter.length > 0
+        ? new RegExp(options.modelFilter)
+        : null
 
     const sessions = new Map<string, SessionWatch>()
     let timer: ReturnType<typeof setInterval> | null = null
@@ -226,6 +232,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 recentToolCalls: [],
                 toolLoopAttempts: 0,
                 isSubagent: false,
+                modelAllowed: null,
             }
             sessions.set(sid, w)
         }
@@ -297,6 +304,58 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
     }
 
+    /**
+     * Check whether a session's model matches the modelFilter regex.
+     * Caches the result in SessionWatch.modelAllowed so we only fetch messages once.
+     * If modelFilter is null (not configured), all models are allowed.
+     */
+    async function isModelAllowed(sid: string, w: SessionWatch): Promise<boolean> {
+        if (!modelFilter) return true
+        if (w.modelAllowed !== null) return w.modelAllowed
+
+        try {
+            const msgResp = await ctx.client.session.messages({ path: { id: sid } })
+            const msgs = extractMessages(msgResp as Record<string, unknown>)
+
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                const role =
+                    (msg.role as string) ??
+                    ((msg.info as Record<string, unknown> | undefined)?.role as string)
+                if (role === "user") {
+                    let rawModel = msg.model as
+                        | { providerID: string; modelID: string }
+                        | undefined
+                    if (!rawModel) {
+                        rawModel = (msg.info as Record<string, unknown> | undefined)?.model as
+                            | { providerID: string; modelID: string }
+                            | undefined
+                    }
+                    if (
+                        rawModel &&
+                        typeof rawModel.providerID === "string" &&
+                        typeof rawModel.modelID === "string"
+                    ) {
+                        const modelStr = `${rawModel.providerID}/${rawModel.modelID}`
+                        w.modelAllowed = modelFilter.test(modelStr)
+                        await log("debug", `${short(sid)} - model filter "${modelFilter.source}" ${w.modelAllowed ? "matched" : "did not match"} "${modelStr}"`)
+                        return w.modelAllowed
+                    }
+                    break
+                }
+            }
+            // No user message found with model info — allow by default
+            w.modelAllowed = true
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `${short(sid)} - model filter check failed: ${errMsg}`)
+            // On error, allow to avoid blocking recovery
+            w.modelAllowed = true
+            return true
+        }
+    }
+
     /** Clean up idle sessions that have been idle too long. */
     function cleanupIdleSessions() {
         const now = Date.now()
@@ -342,6 +401,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             return
         }
         w.continuing = true
+
+        // Model filter check: skip recovery if this session's model doesn't match
+        if (!(await isModelAllowed(sid, w))) {
+            await log("info", `${short(sid)} - model does not match filter, skipping recovery`)
+            w.continuing = false
+            return
+        }
         
         let agent: string | undefined
         let model: { providerID: string; modelID: string } | undefined
@@ -913,6 +979,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("warn", `Invalid sid for abort: ${sid} (must start with "ses_")`)
             return false
         }
+        // Model filter check: skip abort+resume if this session's model doesn't match
+        if (!(await isModelAllowed(sid, w))) {
+            await log("info", `${short(sid)} - model does not match filter, skipping abort+resume`)
+            return false
+        }
         if (w.aborting) return false
         w.aborting = true
 
@@ -1375,7 +1446,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         event: async ({ event }) => {
             if (!initialised) {
                 initialised = true
-                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+                const filterMsg = modelFilter ? `, modelFilter=/${modelFilter.source}/` : ""
+                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s${filterMsg}`)
             }
             handleEvent(event as Record<string, unknown>)
         },

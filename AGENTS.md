@@ -76,6 +76,7 @@ docs/
 | `subagentWaitMs` | 15000 | Wait before orphan-parent recovery |
 | `loopMaxContinues` | 3 | Max continues in hallucination window |
 | `baseBackoffMs` / `maxBackoffMs` | 1000 / 8000 | Retry backoff range |
+| `modelFilter` | `""` (disabled) | Regex string — only recover sessions whose `providerID/modelID` matches (e.g. `"anthropic/.*"`) |
 
 ## Testing
 

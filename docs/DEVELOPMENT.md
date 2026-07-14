@@ -89,6 +89,7 @@ The simpler mock in `index.plugin.test.ts` is also useful as a starting point fo
 - **Mock ordering**: `ctx.client.session.messages` can be set up to return different data for different sessions
 - **Timers in tests**: The plugin uses `setInterval`/`setTimeout` internally. Tests generally avoid waiting by directly calling event handlers or checking state rather than waiting for timer ticks
 - **No external services**: All tests are purely in-memory
+- **Model filter tests**: When testing `modelFilter`, mock `ctx.client.session.messages` to return messages with a `model` field containing `{ providerID, modelID }`. The filter regex is tested against `providerID/modelID`. Pass `modelFilter: "anthropic/.*"` in options to test filtering.
 
 ## Adding a New Recovery Mechanism
 

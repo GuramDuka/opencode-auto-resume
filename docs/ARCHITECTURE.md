@@ -23,6 +23,10 @@ The plugin returns three lifecycle hooks:
 | `config` | Config reload | Log confirmation |
 | `tool` | Agent calls `task_complete` | Deterministic completion signal |
 
+### Options
+
+The plugin accepts an optional `modelFilter` string. When set, it is compiled to a `RegExp` and tested against `providerID/modelID` (e.g. `anthropic/claude-3`). Recovery actions (continue, abort+resume) are skipped for sessions whose model does not match. The result is cached per session in `SessionWatch.modelAllowed` to avoid redundant API calls.
+
 ## Core State: `SessionWatch`
 
 Every tracked session has a `SessionWatch` object. This is the full state machine:
@@ -199,6 +203,7 @@ All logging goes through `ctx.client.app.log()` — never `console.log`. Log lev
 |----------|---------|
 | `short(sid)` | Truncates session IDs for readable logs |
 | `backoffMs(attempt)` | Exponential backoff: `baseBackoff * 2^(attempt-1)`, capped at `maxBackoffMs` |
+| `isModelAllowed(sid, w)` | Checks session model against `modelFilter` regex. Caches result in `w.modelAllowed`. Always returns `true` if `modelFilter` is null. |
 | `getSid(ev)` | Extracts sessionID from various event shapes |
 | `getError(ev)` | Extracts error object from event shapes |
 | `getStatus(ev)` | Extracts status object from event shapes |

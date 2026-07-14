@@ -130,6 +130,7 @@ bun run build
 | `subagentWaitMs` | `15000` | Wait before treating orphan parent as stuck |
 | `loopMaxContinues` | `3` | Continues in window before triggering abort |
 | `loopWindowMs` | `600000` | Hallucination loop detection window (10 min) |
+| `modelFilter` | `""` | Regex string to restrict recovery to specific models. Tested against `providerID/modelID` (e.g. `"anthropic/claude-3"`). Leave empty to recover all models. Example: `"anthropic/.*"` recovers only Anthropic models, `".*/claude-.*"` recovers any provider's Claude models. |
 
 ## Verification
 
