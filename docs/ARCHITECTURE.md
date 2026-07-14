@@ -29,7 +29,7 @@ The plugin accepts an optional `modelFilter` string. When set, it is compiled to
 
 ## Core State: `SessionWatch`
 
-Every tracked session has a `SessionWatch` object. This is the full state machine:
+Every tracked session has a `SessionWatch` object. This is the full state machine (24 fields):
 
 ```typescript
 interface SessionWatch {
@@ -74,6 +74,9 @@ interface SessionWatch {
 
   // --- Idle cleanup ---
   idleSince: number | null
+
+  // --- Model filtering ---
+  modelAllowed: boolean | null  // cached model filter result
 }
 ```
 
@@ -204,7 +207,7 @@ All logging goes through `ctx.client.app.log()` — never `console.log`. Log lev
 | `short(sid)` | Truncates session IDs for readable logs |
 | `backoffMs(attempt)` | Exponential backoff: `baseBackoff * 2^(attempt-1)`, capped at `maxBackoffMs` |
 | `isModelAllowed(sid, w)` | Checks session model against `modelFilter` regex. Caches result in `w.modelAllowed`. Always returns `true` if `modelFilter` is null. |
-| `getSid(ev)` | Extracts sessionID from various event shapes |
+| `getSid(ev)` | Extracts sessionID from various event shapes. Filters for `"ses_"` prefix in production. |
 | `getError(ev)` | Extracts error object from event shapes |
 | `getStatus(ev)` | Extracts status object from event shapes |
 | `busyCount()` | Counts non-cancelled busy sessions |
@@ -214,3 +217,9 @@ All logging goes through `ctx.client.app.log()` — never `console.log`. Log lev
 | `resetSessionFlags(w)` | Clears all recovery flags (session went busy) |
 | `resetIdleFlags(w)` | Clears idle-transient flags only |
 | `extractMessages(response)` | Normalizes API response to message array |
+| `checkForToolCallAsText(sid, w)` | Fetches last messages and scans for raw XML/JSON tool call patterns |
+| `checkSubagentStatus(parentSid)` | Checks whether subagents are still running, crashed, or idle |
+| `recoverSubagent(subagentSid)` | Sends a recovery prompt to a stuck subagent |
+| `tryResume(sid, w)` | Sends a "continue" prompt with backoff, hallucination loop detection |
+| `tryAbortAndResume(sid, w)` | Aborts a stuck session then sends a fresh "continue" |
+| `sendContinuePrompt(sid, w, prompt)` | Core prompt sender — fetches messages, extracts agent/model/provider, calls API |

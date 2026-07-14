@@ -32,7 +32,7 @@ Single entry point: `src/index.ts` → `AutoResumePlugin` returns `{ event, conf
 - **`task_complete` tool** — agents call this to signal done (replaces emoji heuristics)
 - **All logging** via `ctx.client.app.log()` — never `console.log`
 
-Core data structure per session: `SessionWatch` (25 fields tracking activity, retries, backoff, todos, tool calls, etc.). See `docs/ARCHITECTURE.md` for the full state machine.
+Core data structure per session: `SessionWatch` (24 fields tracking activity, retries, backoff, todos, tool calls, model filtering, etc.). See `docs/ARCHITECTURE.md` for the full state machine.
 
 ## 9 recovery mechanisms at a glance
 

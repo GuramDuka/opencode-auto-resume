@@ -2,6 +2,16 @@
 
 **Plugin for [OpenCode](https://github.com/anomalyco/opencode) that automatically detects and recovers from LLM session failures — stalls, broken tool calls, hallucination loops, and stuck subagent parents. Fully silent, zero UI pollution.**
 
+## Documentation Index
+
+| Document | When to Read |
+|----------|-------------|
+| `README.md` **(this file)** | Installing or configuring the plugin as an end user |
+| `AGENTS.md` | You're an AI agent working in this repo — quick reference for setup, testing, gotchas |
+| `docs/ARCHITECTURE.md` | You need to understand the state machine, event flow, timer loop |
+| `docs/RECOVERY-MECHANISMS.md` | You're debugging a recovery issue or need details on a specific failure mode |
+| `docs/DEVELOPMENT.md` | You're writing tests, adding a feature, or setting up the repo |
+
 ## What it does
 
 LLM sessions fail in predictable ways. This plugin monitors all sessions and automatically recovers without user intervention.
@@ -142,13 +152,17 @@ To verify the plugin is loaded:
 
 The plugin handles all recovery automatically — no manual intervention needed.
 
+For agent-specific guidance, see [`AGENTS.md`](AGENTS.md).
+
 ## Troubleshooting
 
 | Problem | Solution |
-|---|---|
+|---|---|---|
 | Resumes after ESC | Increase `gracePeriodMs` to `5000` |
 | Too aggressive | Increase `chunkTimeoutMs` to `60000` |
 | Too slow to react | Decrease `checkIntervalMs` to `2000` |
 | Orphan parent not detected | Increase `subagentWaitMs` to `20000` |
 | Hallucination loop not caught | Decrease `loopMaxContinues` to `2` |
 | Tool-text not detected | Check server logs — requires SDK message fetching |
+| `modelFilter` not working | Ensure the regex matches `providerID/modelID` format (e.g. `"anthropic/.*"`). Check logs for `model filter "..." matched/did not match "..."` |
+| Plugin not detecting recovery-needing sessions | Check if `modelFilter` is set — sessions whose model doesn't match are skipped entirely |
